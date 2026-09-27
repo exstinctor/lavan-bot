@@ -12,10 +12,27 @@ on:
   pull_request:
     branches: ["main"]
 
+# Если пуши идут подряд — отменяем предыдущий прогон той же ветки/PR, чтобы
+# не запускать параллельно два теста на один и тот же код и не жечь минуты.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Явный минимум прав для GITHUB_TOKEN. Воркфлоу исполняет код из PR (в том
+# числе из форков), содержимое репозитория ему нужно только на чтение.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    # Страховка от зависшего pytest / сетевого ступора при pip install:
+    # без этого job может висеть до 6 часов (дефолт GitHub — 360 минут).
+    timeout-minutes: 10
     strategy:
+      # false — если 3.11 упал, всё равно хотим увидеть результат 3.12:
+      # так сразу видно, регрессия во всех версиях или специфично для одной.
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
 
@@ -26,16 +43,25 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
+          # По умолчанию кэш смотрит только на requirements.txt; указываем
+          # оба файла явно, иначе изменения в requirements-dev.txt не будут
+          # инвалидировать pip-кэш.
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      # py_compile идёт ДО pip install: он не требует зависимостей (только
+      # stdlib), а синтаксис проверяется за секунды — не тратим время на
+      # сетевую установку пакетов, если в коде просто незакрытая скобка.
+      # xargs -r корректно работает на пустом вводе и с пробелами в путях.
+      - name: Проверка синтаксиса (py_compile)
+        run: git ls-files -z '*.py' | xargs -0 -r python -m py_compile
 
       - name: Установить зависимости
         run: |
-          pip install -r requirements.txt
-          pip install -r requirements-dev.txt
-
-      - name: Проверка синтаксиса (py_compile)
-        run: |
-          python -m py_compile $(git ls-files '*.py')
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Юнит-тесты (utils/backup_core)
-        run: |
-          pytest -q
+        run: pytest -q tests/
